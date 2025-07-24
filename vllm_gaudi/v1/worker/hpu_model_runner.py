@@ -14,6 +14,7 @@ import habana_frameworks.torch.internal.bridge_config as bc
 import numpy as np
 import torch
 import torch.distributed
+import torch.nn as nn
 import vllm_gaudi.extension.environment as environment
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.extension.profiler import HabanaMemoryProfiler, format_bytes
@@ -45,7 +46,10 @@ from vllm.v1.worker.utils import bind_kv_cache
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+
+from vllm.config import LoRAConfig, ModelConfig, SchedulerConfig
+from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+from vllm.model_executor.models import supports_lora, supports_multimodal
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
@@ -524,7 +528,7 @@ def pad_list(input, target_len, val_generator):
     return input
 
 
-class HPUModelRunner(LoRAModelRunnerMixin):
+class HPUModelRunner:
 
     def __init__(
         self,
@@ -640,6 +644,34 @@ class HPUModelRunner(LoRAModelRunnerMixin):
         # TODO(madamczyk-intel): add a knob for that
         # TODO(madamczyk-intel): debug why increasing it lowers acc
         self.logits_rounding = 1
+
+    def load_lora_model(self, model: nn.Module, model_config: ModelConfig,
+                        scheduler_config: SchedulerConfig,
+                        lora_config: LoRAConfig, device: str) -> nn.Module:
+
+        if not supports_lora(model):
+            raise ValueError(
+                f"{model.__class__.__name__} does not support LoRA yet.")
+
+        if supports_multimodal(model):
+            logger.warning("Regarding multimodal models, vLLM currently "
+                           "only supports adding LoRA to language model.")
+
+        # Use get_text_config() in case of multimodal models
+        text_config = model_config.hf_config.get_text_config()
+
+        # Add LoRA Manager to the Model Runner
+        self.lora_manager = LRUCacheWorkerLoRAManager(
+            scheduler_config.max_num_seqs,
+            scheduler_config.max_num_batched_tokens,
+            model_config.get_vocab_size(),
+            lora_config,
+            device,
+            model.embedding_modules,
+            model.embedding_padding_modules,
+            max_position_embeddings=text_config.max_position_embeddings,
+        )
+        return self.lora_manager.create_lora_manager(model)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
