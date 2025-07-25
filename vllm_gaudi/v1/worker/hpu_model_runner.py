@@ -7,7 +7,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, Callable, Optional, TypeAlias, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional, TypeAlias, Union, Set, List
 
 import habana_frameworks.torch as htorch
 import habana_frameworks.torch.internal.bridge_config as bc
@@ -47,9 +47,12 @@ from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.distributed.parallel_state import get_pp_group
 
+from vllm.lora.layers import LoRAMapping
+from vllm.lora.request import LoRARequest
 from vllm.config import LoRAConfig, ModelConfig, SchedulerConfig
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from vllm.model_executor.models import supports_lora, supports_multimodal
+from vllm_gaudi.extension.ops import LoraMask as LoraMask
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
@@ -439,9 +442,10 @@ class HpuModelAdapter(torch.nn.Module):
 
 
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
-    return htorch.hpu.wrap_in_hpu_graph(
+    '''return htorch.hpu.wrap_in_hpu_graph(
         HpuModelAdapter(*args, **kwargs), disable_tensor_cache=True
-    ) if htorch.utils.internal.is_lazy() else HpuModelAdapter(*args, **kwargs)
+    ) if htorch.utils.internal.is_lazy() else HpuModelAdapter(*args, **kwargs)'''
+    return  HpuModelAdapter(*args, **kwargs)
 
 
 def subtuple(obj: object,
@@ -615,7 +619,7 @@ class HPUModelRunner:
         self.use_hpu_graph = not self.model_config.enforce_eager
         self.max_batch_size = self.scheduler_config.max_num_seqs
         self.max_num_seqs = self.scheduler_config.max_num_seqs
-        self.max_prefill_batch_size = 1  # TODO(kzawora): add knob for that
+        self.max_prefill_batch_size = 2  # TODO(kzawora): add knob for that
         self.seen_configs: set = set()
         self.max_num_batched_tokens = \
             self.scheduler_config.max_num_batched_tokens
@@ -645,6 +649,76 @@ class HPUModelRunner:
         # TODO(madamczyk-intel): debug why increasing it lowers acc
         self.logits_rounding = 1
 
+    def create_lora_mask(self, input_tokens: torch.Tensor, lora_ids: List[int],
+                         is_prompt: bool):
+        '''
+        This is a helper function to create the mask for lora computations.
+        Lora Mask is needed to ensure we match the correct lora weights for the
+        for the request.
+        For Prompt phase we have
+        lora_mask with shape (batch_size * seq_len, max_loras * max_rank)
+        lora_logits_mask with shape (batch_size, max_loras * max_rank)
+        For Decode phase we have both
+        lora_mask and lora_logits_mask with shape
+        (batch_size, max_loras * max_rank)
+        '''
+        lora_mask: torch.Tensor = None
+        lora_logits_mask: torch.Tensor = None
+        lora_index = 0
+
+        if self.lora_config:
+            if is_prompt:
+                lora_mask = torch.zeros(
+                    input_tokens.shape[0] * input_tokens.shape[1],
+                    (self.lora_config.max_loras) *\
+                        self.lora_config.max_lora_rank,
+                    dtype=self.lora_config.lora_dtype)
+                lora_logits_mask = torch.zeros(
+                    input_tokens.shape[0], (self.lora_config.max_loras) *
+                    self.lora_config.max_lora_rank,
+                    dtype=self.lora_config.lora_dtype)
+
+                ones = torch.ones(input_tokens.shape[1],
+                                  self.lora_config.max_lora_rank,
+                                  dtype=self.lora_config.lora_dtype)
+                logit_ones = torch.ones(1,
+                                        self.lora_config.max_lora_rank,
+                                        dtype=self.lora_config.lora_dtype)
+
+                for i in range(len(lora_ids)):
+                    if lora_ids[i] == 0:
+                        continue
+                    lora_index = self.lora_manager._adapter_manager.\
+                        lora_index_to_id.index(lora_ids[i])
+                    start_row = i * input_tokens.shape[1]
+                    end_row = start_row + input_tokens.shape[1]
+                    start_col = lora_index * self.lora_config.max_lora_rank
+                    end_col = start_col + self.lora_config.max_lora_rank
+                    lora_mask[start_row:end_row, start_col:end_col] = ones
+                    lora_logits_mask[i, start_col:end_col] = logit_ones
+                lora_mask = lora_mask.to('hpu')
+                lora_logits_mask = lora_logits_mask.to('hpu')
+            else:
+                lora_mask = torch.zeros(input_tokens.shape[0],
+                                        (self.lora_config.max_loras) *
+                                        self.lora_config.max_lora_rank,
+                                        dtype=self.lora_config.lora_dtype)
+                ones = torch.ones(1,
+                                  self.lora_config.max_lora_rank,
+                                  dtype=self.lora_config.lora_dtype)
+                for i in range(len(lora_ids)):
+                    if lora_ids[i] == 0:
+                        continue
+                    lora_index = self.lora_manager._adapter_manager.\
+                        lora_index_to_id.index(lora_ids[i])
+                    start_pos = lora_index * self.lora_config.max_lora_rank
+                    end_pos = start_pos + self.lora_config.max_lora_rank
+                    lora_mask[i, start_pos:end_pos] = ones
+                lora_mask = lora_mask.to('hpu')
+                lora_logits_mask = lora_mask
+
+        return lora_mask, lora_logits_mask
+
     def load_lora_model(self, model: nn.Module, model_config: ModelConfig,
                         scheduler_config: SchedulerConfig,
                         lora_config: LoRAConfig, device: str) -> nn.Module:
@@ -672,6 +746,12 @@ class HPUModelRunner:
             max_position_embeddings=text_config.max_position_embeddings,
         )
         return self.lora_manager.create_lora_manager(model)
+
+    def set_active_loras(self, lora_requests: Set[LoRARequest],
+                         lora_mapping: LoRAMapping) -> None:
+        if not self.lora_manager:
+            raise RuntimeError("LoRA is not enabled.")
+        self.lora_manager.set_active_adapters(lora_requests, lora_mapping)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -766,7 +846,6 @@ class HPUModelRunner:
                 generator.manual_seed(sampling_params.seed)
             else:
                 generator = None
-
             self.requests[req_id] = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
@@ -1412,7 +1491,9 @@ class HPUModelRunner:
                                attn_metadata,
                                logits_indices,
                                kv_caches,
-                               warmup_mode=False):
+                               lora_logits_mask,
+                               warmup_mode=False,
+                               ):
 
         # FORWARD.
         batch_size = token_ids.size(0)
@@ -1439,6 +1520,7 @@ class HPUModelRunner:
 
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = hidden_states[logits_indices]
+        LoraMask.setLoraMask(lora_logits_mask)
         logits = self.model.compute_logits(hidden_states, None)
         return non_flattened_hidden_states, logits
 
@@ -1603,11 +1685,30 @@ class HPUModelRunner:
                       logits_requests) in enumerate(
                           zip(*shallow_tuple(prefill_data))):
                 htorch.core.mark_step()
+                ###### Code for LoRA. Move to a function later #######
+                # TODO: This may not be handling BS > 1 case correctly
+                # TODO: This may not be handling merged prefill case correctly
+                lora_id = scheduler_output.scheduled_new_reqs[idx].lora_request.lora_int_id
+                lora_request = scheduler_output.scheduled_new_reqs[idx].lora_request
+                lora_requests = []
+                if lora_id > 0:
+                    lora_requests.append(lora_request)
+                lora_index_mapping = [lora_id] * (token_ids.shape[0]*token_ids.shape[1])
+                lora_prompt_mapping = [lora_id]  #TODO: This may need to change for some cases
+                lora_mapping = LoRAMapping(lora_index_mapping,
+                                        lora_prompt_mapping,
+                                        is_prefill=True)
+                self.set_active_loras(lora_requests, lora_mapping)
+                lora_mask, lora_logits_mask = self.create_lora_mask(
+                    token_ids, [lora_id],True)
+                LoraMask.setLoraMask(lora_mask)
+
                 prefill_hidden_states_ts, logits_device = \
                     self._execute_model_generic(
                         token_ids, position_ids, attn_metadata, logits_indices,
-                        self.kv_caches)
+                        self.kv_caches, lora_logits_mask)
                 htorch.core.mark_step()
+
                 sampling_metadata = self._prepare_sampling(
                     batch_changed, req_id, pad_to=logits_device.shape[0])
                 sampler_output = self.sampler(
@@ -1622,10 +1723,27 @@ class HPUModelRunner:
         if num_decodes > 0:
             assert decode_data is not None
             htorch.core.mark_step()
+            ###### Code for LoRA. Move to a function later #######
+            #TODO: This may not be handling BS > 1 case correctly
+            lora_id = self.requests[scheduler_output.scheduled_cached_reqs.req_ids[0]].lora_request.lora_int_id
+            lora_request = self.requests[scheduler_output.scheduled_cached_reqs.req_ids[0]].lora_request
+            lora_requests = []
+            if lora_id > 0:
+                lora_requests.append(lora_request)
+            lora_index_mapping = [lora_id]
+            lora_prompt_mapping = [lora_id]
+            lora_mapping = LoRAMapping(lora_index_mapping,
+                                    lora_prompt_mapping,
+                                    is_prefill=False)
+            self.set_active_loras(lora_requests, lora_mapping)
+            lora_mask, lora_logits_mask = self.create_lora_mask(
+                torch.tensor([0]).to('hpu'), [lora_id],False)
+            LoraMask.setLoraMask(lora_mask)
+
             _, logits_device = self._execute_model_generic(
                 decode_data.token_ids, decode_data.position_ids,
                 decode_data.attn_metadata, decode_data.logits_indices,
-                self.kv_caches)
+                self.kv_caches, lora_logits_mask)
             htorch.core.mark_step()
             sampling_metadata = self._prepare_sampling(
                 batch_changed,
@@ -1956,7 +2074,7 @@ class HPUModelRunner:
         logits = self._execute_model_generic(input_ids_device,
                                              position_ids_device,
                                              attn_metadata,
-                                             logits_indices_device, kv_caches,
+                                             logits_indices_device, kv_caches, None,
                                              True)
         # TODO: do sampling on logits, warmup sampler and prefill joiner
         htorch.core.mark_step()
