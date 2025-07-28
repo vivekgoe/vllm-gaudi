@@ -1155,6 +1155,7 @@ class HPUModelRunner:
             logits_positions = list(
                 range(query_len - num_output_logits, query_len))
 
+
             new_batch_contents = BatchContents(
                 req_ids=[req_id],
                 token_ids=[token_ids],
@@ -1685,22 +1686,27 @@ class HPUModelRunner:
                       logits_requests) in enumerate(
                           zip(*shallow_tuple(prefill_data))):
                 htorch.core.mark_step()
-                ###### Code for LoRA. Move to a function later #######
-                # TODO: This may not be handling BS > 1 case correctly
-                # TODO: This may not be handling merged prefill case correctly
-                lora_id = scheduler_output.scheduled_new_reqs[idx].lora_request.lora_int_id
-                lora_request = scheduler_output.scheduled_new_reqs[idx].lora_request
                 lora_requests = []
-                if lora_id > 0:
-                    lora_requests.append(lora_request)
-                lora_index_mapping = [lora_id] * (token_ids.shape[0]*token_ids.shape[1])
-                lora_prompt_mapping = [lora_id]  #TODO: This may need to change for some cases
+                lora_ids = []
+                lora_index_mapping = []
+                lora_prompt_mapping = []
+                ###### Code for LoRA. Move to a function later #######
+                # We only need lora_mask and lora_logits_mask here, everything else
+                # could have been done in _prepare_inputs
+                for i, r_id in enumerate(req_id):
+                    lora_id = self.requests[r_id].lora_request.lora_int_id
+                    lora_request = self.requests[r_id].lora_request
+                    if lora_id > 0:
+                        lora_requests.append(lora_request)
+                    lora_index_mapping += [lora_id] * (token_ids.shape[1])
+                    lora_prompt_mapping += [lora_id]  #TODO: This may need to change for some cases
+                    lora_ids.append(lora_id)
                 lora_mapping = LoRAMapping(lora_index_mapping,
                                         lora_prompt_mapping,
                                         is_prefill=True)
                 self.set_active_loras(lora_requests, lora_mapping)
                 lora_mask, lora_logits_mask = self.create_lora_mask(
-                    token_ids, [lora_id],True)
+                    token_ids, lora_ids,True)
                 LoraMask.setLoraMask(lora_mask)
 
                 prefill_hidden_states_ts, logits_device = \
@@ -1723,21 +1729,31 @@ class HPUModelRunner:
         if num_decodes > 0:
             assert decode_data is not None
             htorch.core.mark_step()
-            ###### Code for LoRA. Move to a function later #######
-            #TODO: This may not be handling BS > 1 case correctly
-            lora_id = self.requests[scheduler_output.scheduled_cached_reqs.req_ids[0]].lora_request.lora_int_id
-            lora_request = self.requests[scheduler_output.scheduled_cached_reqs.req_ids[0]].lora_request
             lora_requests = []
-            if lora_id > 0:
-                lora_requests.append(lora_request)
-            lora_index_mapping = [lora_id]
-            lora_prompt_mapping = [lora_id]
+            lora_ids = []
+            lora_index_mapping = []
+            lora_prompt_mapping = []
+            ###### Code for LoRA. Move to a function later #######
+            for i, r_id in enumerate(pd_info.decode_req_ids):
+                lora_id = self.requests[r_id].lora_request.lora_int_id
+                lora_request = self.requests[r_id].lora_request
+                lora_requests = []
+                if lora_id > 0:
+                    lora_requests.append(lora_request)
+                lora_index_mapping += [lora_id]
+                lora_prompt_mapping += [lora_id]
+                lora_ids.append(lora_id)
+            if decode_data.token_ids.shape[0] > len(pd_info.decode_req_ids): #TODO: Need to remove this hack for handling padding
+                for i in range(decode_data.token_ids.shape[0] - len(pd_info.decode_req_ids)):
+                    lora_index_mapping += [lora_id]
+                    lora_prompt_mapping += [lora_id]
+                    lora_ids.append(lora_id)
             lora_mapping = LoRAMapping(lora_index_mapping,
                                     lora_prompt_mapping,
                                     is_prefill=False)
             self.set_active_loras(lora_requests, lora_mapping)
             lora_mask, lora_logits_mask = self.create_lora_mask(
-                torch.tensor([0]).to('hpu'), [lora_id],False)
+                decode_data.token_ids, lora_ids, False)
             LoraMask.setLoraMask(lora_mask)
 
             _, logits_device = self._execute_model_generic(
