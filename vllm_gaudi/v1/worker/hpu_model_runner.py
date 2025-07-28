@@ -1694,8 +1694,8 @@ class HPUModelRunner:
                 # We only need lora_mask and lora_logits_mask here, everything else
                 # could have been done in _prepare_inputs
                 for i, r_id in enumerate(req_id):
-                    lora_id = self.requests[r_id].lora_request.lora_int_id
                     lora_request = self.requests[r_id].lora_request
+                    lora_id = self.requests[r_id].lora_request.lora_int_id if lora_request else 0
                     if lora_id > 0:
                         lora_requests.append(lora_request)
                     lora_index_mapping += [lora_id] * (token_ids.shape[1])
@@ -1735,8 +1735,8 @@ class HPUModelRunner:
             lora_prompt_mapping = []
             ###### Code for LoRA. Move to a function later #######
             for i, r_id in enumerate(pd_info.decode_req_ids):
-                lora_id = self.requests[r_id].lora_request.lora_int_id
                 lora_request = self.requests[r_id].lora_request
+                lora_id = self.requests[r_id].lora_request.lora_int_id if lora_request else 0
                 lora_requests = []
                 if lora_id > 0:
                     lora_requests.append(lora_request)
@@ -2033,6 +2033,7 @@ class HPUModelRunner:
         input_ids_device = _async_h2d_tensor_copy(input_ids, self.device)
         position_ids_device = _async_h2d_tensor_copy(position_ids, self.device)
         slot_mapping_device = _async_h2d_tensor_copy(slot_mapping, self.device)
+
         times = 3 if use_graphs or is_pt_profiler_run else 1
         for time_index in range(times):
             if is_prompt:
@@ -2085,12 +2086,50 @@ class HPUModelRunner:
         logits_indices = torch.arange(0, batch_size, device='cpu')
         logits_indices_device = _async_h2d_tensor_copy(logits_indices,
                                                        self.device)
+
+        # TODO: Fix the GC assert seen when this is enabled
+        '''dummy_lora_requests: List[LoRARequest] = []
+        dummy_lora_requests_per_seq: List[LoRARequest] = []
+        if self.lora_config:
+            assert self.lora_manager is not None
+            with self.lora_manager.dummy_lora_cache():
+                for idx in range(self.lora_config.max_loras):
+                    lora_id = idx + 1
+                    dummy_lora_request = LoRARequest(
+                        lora_name=f"warmup_{lora_id}",
+                        lora_int_id=lora_id,
+                        lora_local_path="/not/a/real/path",
+                    )
+                    self.lora_manager.add_dummy_lora(dummy_lora_request,
+                                                     rank=8)
+                    dummy_lora_requests.append(dummy_lora_request)
+                dummy_lora_requests_per_seq = [
+                    dummy_lora_requests[idx % len(dummy_lora_requests)]
+                    for idx in range(batch_size)
+                ]
+
+            lora_ids = []
+            lora_index_mapping = []
+            lora_prompt_mapping = []
+            for idx in range(batch_size):
+                lora_id = dummy_lora_requests_per_seq[idx].lora_int_id
+                lora_index_mapping += [lora_id] * query_seq_len
+                lora_prompt_mapping += [lora_id]
+                lora_ids.append(lora_id)
+            lora_mapping = LoRAMapping(lora_index_mapping,
+                                    lora_prompt_mapping,
+                                    is_prefill=is_prompt)
+            self.set_active_loras(dummy_lora_requests_per_seq, lora_mapping)
+            lora_mask, lora_logits_mask = self.create_lora_mask(
+                input_ids, lora_ids, is_prompt)
+            LoraMask.setLoraMask(lora_mask)'''
+
         # Dummy run.
         htorch.core.mark_step()
         logits = self._execute_model_generic(input_ids_device,
                                              position_ids_device,
                                              attn_metadata,
-                                             logits_indices_device, kv_caches, None,
+                                             logits_indices_device, kv_caches, lora_logits_mask,
                                              True)
         # TODO: do sampling on logits, warmup sampler and prefill joiner
         htorch.core.mark_step()
