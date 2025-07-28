@@ -8,7 +8,7 @@ from vllm.lora.layers import VocabParallelEmbeddingWithLoRA
 @CustomOp.register_oot(name='VocabParallelEmbeddingWithLoRA')
 class HPUVocabParallelEmbeddingWithLoRA(VocabParallelEmbeddingWithLoRA):
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         # x need to reshaped into 2d as batch is there
         # can be removed on moving to flat tensors
         shape = x.shape
@@ -46,6 +46,3 @@ class HPUVocabParallelEmbeddingWithLoRA(VocabParallelEmbeddingWithLoRA):
         full_output_org = full_output_org.view(shape[0], shape[1],
                                                full_output_org.shape[1])
         return full_output.view_as(full_output_org)
-
-#TODO: This is not correct. Right now we are monkey patching the class instead of using CustomOp.
-layers.VocabParallelEmbeddingWithLoRA = HPUVocabParallelEmbeddingWithLoRA
