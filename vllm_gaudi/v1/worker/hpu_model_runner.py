@@ -2311,8 +2311,8 @@ class HPUModelRunner:
                 for lora_req in lora_requests:
                     lora_id = lora_req.lora_int_id if lora_req else 0
                     lora_index_mapping += [lora_id] * (input.shape[1])
-                    #TODO: This may need to change when logprobs
-                    # sampling is enabled
+                    # TODO: Review lora_prompt_mapping logic when logprobs sampling is enabled,
+                    # as the current mapping may not correctly handle logprobs-related requests.
                     lora_prompt_mapping += [lora_id]
                     lora_ids.append(lora_id)
             else:
